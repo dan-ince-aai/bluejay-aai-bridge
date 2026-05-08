@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+Bluejay (CHIRP protocol) <-> AssemblyAI Voice Agent API bridge.
+
+Bluejay opens a WebSocket TO this server. We bridge the conversation through
+to AssemblyAI's Voice Agent API using the same agent config as the production
+homepage agent (see agent_config.py).
+
+Protocol notes:
+  - Bluejay speaks 16 kHz mono pcm_s16le (binary) plus optional CHIRP text
+    events: speech.started, speech.completed, session.error.
+  - AssemblyAI Voice Agent API speaks 24 kHz mono pcm_s16le wrapped in JSON
+    (input.audio inbound, reply.audio outbound).
+  - We resample 16k <-> 24k with scipy.signal.resample_poly (3:2 up, 2:3 down)
+    and translate event shapes.
+  - HTTP Basic auth on the upgrade per CHIRP. Set CHIRP_USER and CHIRP_PASS
+    env vars to enable; leave unset to skip auth (dev only).
+"""
+
+import asyncio
+import base64
+import json
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+import aiohttp
+import numpy as np
+from aiohttp import web, WSMsgType
+from scipy.signal import resample_poly
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+from agent_config import (
+    MCP_URL,
+    execute_mcp_tool,
+    pick_voice,
+    session_config,
+)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", os.getenv("API_KEY", ""))
+AAI_WS_URL = os.getenv("AAI_WS_URL", "wss://agents.assemblyai.com/v1/realtime")
+PORT = int(os.getenv("PORT", 8767))
+
+# HTTP Basic auth on the WS upgrade (per CHIRP spec). If unset, the server
+# accepts any connection — dev only, do not deploy without these set.
+CHIRP_USER = os.getenv("CHIRP_USER", "")
+CHIRP_PASS = os.getenv("CHIRP_PASS", "")
+
+# Optional Slack webhook for transcripts. Tagged [Bluejay sim] so simulator
+# runs don't get mixed in with real traffic.
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+
+# Audio constants — Bluejay 16k mono pcm_s16le, AAI 24k mono pcm_s16le.
+BLUEJAY_RATE = 16_000
+AAI_RATE = 24_000
+SAMPLE_BYTES = 2  # int16
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------------
+
+
+def upsample_16_to_24(pcm16k: bytes) -> bytes:
+    """Resample 16 kHz int16 PCM to 24 kHz int16 PCM (up 3, down 2)."""
+    if not pcm16k:
+        return b""
+    samples = np.frombuffer(pcm16k, dtype=np.int16)
+    if samples.size == 0:
+        return b""
+    upsampled = resample_poly(samples, 3, 2)
+    return np.clip(upsampled, -32768, 32767).astype(np.int16).tobytes()
+
+
+def downsample_24_to_16(pcm24k: bytes) -> bytes:
+    """Resample 24 kHz int16 PCM to 16 kHz int16 PCM (up 2, down 3)."""
+    if not pcm24k:
+        return b""
+    samples = np.frombuffer(pcm24k, dtype=np.int16)
+    if samples.size == 0:
+        return b""
+    downsampled = resample_poly(samples, 2, 3)
+    return np.clip(downsampled, -32768, 32767).astype(np.int16).tobytes()
+
+
+# ---------------------------------------------------------------------------
+# CHIRP event helpers
+# ---------------------------------------------------------------------------
+
+
+def make_chirp(event_type: str, data: dict) -> str:
+    """Build a CHIRP text frame (UTF-8 JSON)."""
+    return json.dumps({
+        "type": event_type,
+        "id": str(uuid.uuid4()),
+        "ts_ms": int(time.time() * 1000),
+        "data": data,
+    })
+
+
+def expected_basic_auth() -> Optional[str]:
+    if not (CHIRP_USER and CHIRP_PASS):
+        return None
+    creds = f"{CHIRP_USER}:{CHIRP_PASS}".encode()
+    return "Basic " + base64.b64encode(creds).decode()
+
+
+# ---------------------------------------------------------------------------
+# Slack — optional, fire-and-forget transcript posting
+# ---------------------------------------------------------------------------
+
+
+async def post_transcript_to_slack(text: str) -> None:
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(
+                SLACK_WEBHOOK_URL,
+                json={"text": text},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+    except Exception as e:
+        print(f"Slack post failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# WebSocket bridge
+# ---------------------------------------------------------------------------
+
+
+async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
+    """Accept a CHIRP WebSocket from Bluejay, bridge to AssemblyAI."""
+    expected = expected_basic_auth()
+    if expected is not None:
+        if request.headers.get("Authorization") != expected:
+            print("CHIRP auth rejected")
+            return web.Response(status=401, text="Unauthorized")
+
+    bluejay_ws = web.WebSocketResponse()
+    await bluejay_ws.prepare(request)
+    print("Bluejay connected")
+
+    transcript: list = []
+    session_start = datetime.now(timezone.utc)
+    session_id: Optional[str] = None
+    current_utterance_id: Optional[str] = None
+
+    headers = {"Authorization": f"Bearer {ASSEMBLYAI_API_KEY}"}
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.ws_connect(AAI_WS_URL, headers=headers) as aai_ws:
+                # Send session.update FIRST so the greeting fires fast.
+                voice = pick_voice()
+                print(f"  Voice: {voice}")
+                await aai_ws.send_json(session_config(voice))
+
+                # MCP setup runs as a background task — never blocks audio.
+                mcp_holder: dict = {"client": None}
+                mcp_ready = asyncio.Event()
+                mcp_shutdown = asyncio.Event()
+
+                async def mcp_keeper():
+                    try:
+                        async with streamablehttp_client(MCP_URL) as (mr, mw, _), \
+                                   ClientSession(mr, mw) as client:
+                            await client.initialize()
+                            mcp_holder["client"] = client
+                            mcp_ready.set()
+                            print("  MCP connected")
+                            await mcp_shutdown.wait()
+                    except Exception as e:
+                        print(f"MCP setup failed: {e}")
+                        mcp_ready.set()  # unblock so tool calls fail fast
+
+                mcp_task = asyncio.create_task(mcp_keeper())
+                pending_tool_tasks: list[asyncio.Task] = []
+
+                async def run_tool(event: dict) -> dict:
+                    await mcp_ready.wait()
+                    client = mcp_holder["client"]
+                    if client is None:
+                        return {
+                            "call_id": event.get("call_id", ""),
+                            "result": "Docs lookup is currently unavailable.",
+                        }
+                    return await execute_mcp_tool(client, event)
+
+                # Set when the agent is idle (not mid-reply). Used to wait
+                # for any in-flight utterance before tearing down on hangup.
+                agent_idle = asyncio.Event()
+                agent_idle.set()
+
+                async def safe_send_text(payload: str):
+                    if bluejay_ws.closed:
+                        return
+                    try:
+                        await bluejay_ws.send_str(payload)
+                    except Exception:
+                        pass
+
+                async def safe_send_bytes(payload: bytes):
+                    if bluejay_ws.closed or not payload:
+                        return
+                    try:
+                        await bluejay_ws.send_bytes(payload)
+                    except Exception:
+                        pass
+
+                async def bluejay_to_aai():
+                    """Pump from Bluejay (16k binary, optional CHIRP text) to AAI."""
+                    try:
+                        async for msg in bluejay_ws:
+                            if msg.type == WSMsgType.BINARY:
+                                pcm24k = upsample_16_to_24(msg.data)
+                                if pcm24k:
+                                    await aai_ws.send_json({
+                                        "type": "input.audio",
+                                        "audio": base64.b64encode(pcm24k).decode(),
+                                    })
+                            elif msg.type == WSMsgType.TEXT:
+                                # Optional CHIRP control events from Bluejay.
+                                # We trust AAI's audio-driven VAD for barge-in,
+                                # so we just log these.
+                                try:
+                                    event = json.loads(msg.data)
+                                    print(f"  Bluejay → {event.get('type')}: {event.get('data')}")
+                                except Exception:
+                                    pass
+                            elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                                break
+                    finally:
+                        # Bluejay hung up — wait briefly for any in-flight
+                        # agent utterance to finish before closing AAI, so
+                        # the final transcript event lands.
+                        try:
+                            await asyncio.wait_for(agent_idle.wait(), timeout=60)
+                        except asyncio.TimeoutError:
+                            pass
+                        await aai_ws.close()
+
+                async def aai_to_bluejay():
+                    """Pump from AAI (JSON events) to Bluejay (binary + CHIRP text)."""
+                    nonlocal session_id, current_utterance_id
+                    try:
+                        async for msg in aai_ws:
+                            if msg.type != WSMsgType.TEXT:
+                                continue
+                            event = json.loads(msg.data)
+                            t = event.get("type")
+
+                            if t == "session.ready":
+                                session_id = event.get("session_id")
+                                print(f"  Session ready: {session_id}")
+
+                            elif t == "transcript.user":
+                                text = event.get("text", "")
+                                if text:
+                                    transcript.append({
+                                        "role": "user",
+                                        "text": text,
+                                        "ts": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                    print(f"  User: {text}")
+
+                            elif t == "transcript.agent":
+                                text = event.get("text", "")
+                                interrupted = event.get("interrupted", False)
+                                if text:
+                                    entry = {
+                                        "role": "agent",
+                                        "text": text,
+                                        "interrupted": interrupted,
+                                        "ts": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                    # Dedup of double-emitted utterance.
+                                    if (transcript
+                                            and transcript[-1].get("role") == "agent"
+                                            and transcript[-1].get("text") == text):
+                                        transcript[-1] = entry
+                                    else:
+                                        transcript.append(entry)
+                                    tag = " (interrupted)" if interrupted else ""
+                                    print(f"  Agent: {text}{tag}")
+
+                            elif t == "reply.audio":
+                                agent_idle.clear()
+                                # First audio chunk of a new agent turn —
+                                # emit CHIRP speech.started with a fresh id.
+                                if current_utterance_id is None:
+                                    current_utterance_id = f"u_{uuid.uuid4().hex[:12]}"
+                                    await safe_send_text(make_chirp(
+                                        "speech.started",
+                                        {"utterance_id": current_utterance_id},
+                                    ))
+                                audio_b64 = event.get("data", "")
+                                if audio_b64:
+                                    pcm24k = base64.b64decode(audio_b64)
+                                    await safe_send_bytes(downsample_24_to_16(pcm24k))
+
+                            elif t == "tool.call":
+                                # Spawn the MCP call in the background so the
+                                # audio pump stays responsive while it runs.
+                                pending_tool_tasks.append(
+                                    asyncio.create_task(run_tool(event))
+                                )
+
+                            elif t == "reply.done":
+                                # End of an agent utterance. Tell Bluejay,
+                                # and flush any pending tool results (or drop
+                                # them on interrupt).
+                                if current_utterance_id is not None:
+                                    await safe_send_text(make_chirp(
+                                        "speech.completed",
+                                        {"utterance_id": current_utterance_id},
+                                    ))
+                                    current_utterance_id = None
+                                agent_idle.set()
+                                if event.get("status") == "interrupted":
+                                    for task in pending_tool_tasks:
+                                        task.cancel()
+                                    pending_tool_tasks.clear()
+                                elif pending_tool_tasks:
+                                    results = await asyncio.gather(
+                                        *pending_tool_tasks, return_exceptions=True
+                                    )
+                                    pending_tool_tasks.clear()
+                                    for r in results:
+                                        if isinstance(r, dict) and r.get("call_id"):
+                                            await aai_ws.send_json({
+                                                "type": "tool.result",
+                                                "call_id": r["call_id"],
+                                                "result": r["result"],
+                                            })
+
+                            elif t in ("error", "session.error"):
+                                msg_text = event.get("message", event.get("code", "Unknown error"))
+                                await safe_send_text(make_chirp(
+                                    "session.error",
+                                    {"code": "INTERNAL_ERROR", "message": msg_text},
+                                ))
+                    finally:
+                        if not bluejay_ws.closed:
+                            await bluejay_ws.close()
+
+                try:
+                    await asyncio.gather(bluejay_to_aai(), aai_to_bluejay())
+                finally:
+                    for task in pending_tool_tasks:
+                        task.cancel()
+                    mcp_shutdown.set()
+                    try:
+                        await asyncio.wait_for(mcp_task, timeout=5)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+
+    except Exception as e:
+        print(f"Session error: {e}")
+
+    duration = (datetime.now(timezone.utc) - session_start).total_seconds()
+    print(f"Bluejay disconnected (session: {duration:.0f}s, {len(transcript)} turns)")
+
+    if transcript and SLACK_WEBHOOK_URL:
+        sid = session_id or "unknown"
+        slack_text = f"*[Bluejay sim] Voice Agent Session* (`{sid}`, {duration:.0f}s)\n\n"
+        for m in transcript:
+            role = m["role"]
+            text = m["text"]
+            if role == "user":
+                slack_text += f"👤 User: {text}\n"
+            elif role == "agent":
+                tag = " _(interrupted)_" if m.get("interrupted") else ""
+                slack_text += f"🤖 Agent: {text}{tag}\n"
+        await post_transcript_to_slack(slack_text)
+
+    return bluejay_ws
+
+
+# ---------------------------------------------------------------------------
+# HTTP routing
+# ---------------------------------------------------------------------------
+
+
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        response = web.Response(status=200)
+    else:
+        response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
+
+
+async def root_handler(request):
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        return await bluejay_handler(request)
+    return web.Response(text="Bluejay <-> AAI bridge — open a WebSocket to /voice", status=200)
+
+
+async def voice_handler(request):
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        return await bluejay_handler(request)
+    return web.Response(text="Open a WebSocket here.", status=400)
+
+
+async def health(request):
+    return web.json_response({"ok": True, "service": "bluejay-aai-bridge"})
+
+
+async def main():
+    if not ASSEMBLYAI_API_KEY:
+        raise SystemExit("Missing ASSEMBLYAI_API_KEY env var.")
+
+    print(f"Bluejay <-> AAI bridge — port {PORT}")
+    print(f"Upstream: {AAI_WS_URL}")
+    print(f"CHIRP auth required: {bool(CHIRP_USER and CHIRP_PASS)}")
+    print(f"Slack transcripts: {bool(SLACK_WEBHOOK_URL)}")
+
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_get("/", root_handler)
+    app.router.add_get("/voice", voice_handler)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    print(f"Ready — ws://0.0.0.0:{PORT}/voice")
+    await asyncio.Future()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
