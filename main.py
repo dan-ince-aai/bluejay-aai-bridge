@@ -195,15 +195,25 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
 
                 async def bluejay_to_aai():
                     """Pump from Bluejay (16k binary, optional CHIRP text) to AAI."""
+                    binary_count = 0
+                    binary_bytes = 0
+                    last_logged_at = 0
+                    other_types: dict = {}
                     try:
                         async for msg in bluejay_ws:
                             if msg.type == WSMsgType.BINARY:
+                                binary_count += 1
+                                binary_bytes += len(msg.data)
                                 pcm24k = upsample_16_to_24(msg.data)
                                 if pcm24k:
                                     await aai_ws.send_json({
                                         "type": "input.audio",
                                         "audio": base64.b64encode(pcm24k).decode(),
                                     })
+                                # Log every ~1s of audio (assuming 20ms frames).
+                                if binary_count - last_logged_at >= 50:
+                                    print(f"  Bluejay audio: {binary_count} frames, {binary_bytes} bytes total")
+                                    last_logged_at = binary_count
                             elif msg.type == WSMsgType.TEXT:
                                 # Optional CHIRP control events from Bluejay.
                                 # We trust AAI's audio-driven VAD for barge-in,
@@ -215,6 +225,9 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
                                     pass
                             elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                                 break
+                            else:
+                                other_types[msg.type] = other_types.get(msg.type, 0) + 1
+                        print(f"  Bluejay→AAI pump done: {binary_count} binary frames, {binary_bytes} bytes, other={other_types}")
                     finally:
                         # Bluejay hung up — wait briefly for any in-flight
                         # agent utterance to finish before closing AAI, so
@@ -321,10 +334,21 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
 
                             elif t in ("error", "session.error"):
                                 msg_text = event.get("message", event.get("code", "Unknown error"))
+                                print(f"  AAI error: {event}")
                                 await safe_send_text(make_chirp(
                                     "session.error",
                                     {"code": "INTERNAL_ERROR", "message": msg_text},
                                 ))
+
+                            elif t == "input.speech.started":
+                                print("  AAI detected user speech")
+
+                            elif t == "transcript.user.delta":
+                                # Interim transcripts — useful to know AAI
+                                # is actually receiving and decoding our audio.
+                                interim = event.get("text", "")
+                                if interim:
+                                    print(f"  User (interim): {interim}")
                     finally:
                         if not bluejay_ws.closed:
                             await bluejay_ws.close()
