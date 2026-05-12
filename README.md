@@ -60,13 +60,16 @@ When the upstream prompt changes, re-sync this file.
 
 ## Tradeoffs
 
-- **scipy** for resampling: ~30 MB cold install, but produces clean
-  polyphase resampling. Alternatives: `audioop` (deprecated 3.13) or
-  `numpy.interp` (lower quality).
+- **Resampling** uses stdlib `audioop.ratecv` because Bluejay sends 10 ms
+  frames (160 samples). Filter-based resamplers like
+  `scipy.signal.resample_poly` introduce a transient on every chunk
+  boundary at that size, which AAI's STT can't decode. `audioop.ratecv`
+  is stateful — filter state is carried across calls so chunk boundaries
+  don't produce artifacts. Note: `audioop` was deprecated in Python 3.13
+  and removed in 3.14; this project pins Python 3.12.
 - **Same random voice rotation** as production — exercises the full voice
   surface. If you want determinism per scenario, accept a `voice` query
   param in `bluejay_handler`.
 - **Bluejay user `speech.started` is currently logged-only**. AAI's VAD
-  barges in fine from the resampled audio alone, and forwarding could
-  cause double interrupts. Easy to wire through if simulations show
-  issues.
+  barges in fine from the audio alone, and forwarding could cause
+  double interrupts. Easy to wire through if simulations show issues.

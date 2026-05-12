@@ -18,18 +18,18 @@ Protocol notes:
 """
 
 import asyncio
+import audioop  # stdlib; deprecated in 3.13, removed in 3.14
 import base64
 import json
 import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import aiohttp
 import numpy as np
 from aiohttp import web, WSMsgType
-from scipy.signal import resample_poly
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -61,30 +61,31 @@ SAMPLE_BYTES = 2  # int16
 
 
 # ---------------------------------------------------------------------------
-# Audio helpers
+# Audio helpers — streaming rate conversion with audioop.ratecv.
+#
+# scipy.signal.resample_poly was attempted first but produced unusable audio
+# for AAI's STT: it applies a polyphase FIR filter that introduces a fresh
+# transient on every chunk boundary, and Bluejay sends 10 ms chunks (160
+# samples at 16 kHz) — far too small for the filter to settle independently
+# per chunk. audioop.ratecv carries state across calls, eliminating the
+# boundary artifacts.
 # ---------------------------------------------------------------------------
 
 
-def upsample_16_to_24(pcm16k: bytes) -> bytes:
-    """Resample 16 kHz int16 PCM to 24 kHz int16 PCM (up 3, down 2)."""
+def upsample_16_to_24(pcm16k: bytes, state) -> Tuple[bytes, object]:
+    """Resample 16 kHz int16 mono → 24 kHz int16 mono. State must be threaded
+    across calls in the same session."""
     if not pcm16k:
-        return b""
-    samples = np.frombuffer(pcm16k, dtype=np.int16)
-    if samples.size == 0:
-        return b""
-    upsampled = resample_poly(samples, 3, 2)
-    return np.clip(upsampled, -32768, 32767).astype(np.int16).tobytes()
+        return b"", state
+    return audioop.ratecv(pcm16k, 2, 1, 16_000, 24_000, state)
 
 
-def downsample_24_to_16(pcm24k: bytes) -> bytes:
-    """Resample 24 kHz int16 PCM to 16 kHz int16 PCM (up 2, down 3)."""
+def downsample_24_to_16(pcm24k: bytes, state) -> Tuple[bytes, object]:
+    """Resample 24 kHz int16 mono → 16 kHz int16 mono. State must be threaded
+    across calls in the same session."""
     if not pcm24k:
-        return b""
-    samples = np.frombuffer(pcm24k, dtype=np.int16)
-    if samples.size == 0:
-        return b""
-    downsampled = resample_poly(samples, 2, 3)
-    return np.clip(downsampled, -32768, 32767).astype(np.int16).tobytes()
+        return b"", state
+    return audioop.ratecv(pcm24k, 2, 1, 24_000, 16_000, state)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +203,7 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
                     window_sum_sq = 0.0  # for RMS
                     window_sample_count = 0
                     other_types: dict = {}
+                    upsample_state = None  # carried across audioop.ratecv calls
                     try:
                         async for msg in bluejay_ws:
                             if msg.type == WSMsgType.BINARY:
@@ -216,7 +218,7 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
                                         window_peak = peak
                                     window_sum_sq += float((in_samples.astype(np.float32) ** 2).sum())
                                     window_sample_count += in_samples.size
-                                pcm24k = upsample_16_to_24(msg.data)
+                                pcm24k, upsample_state = upsample_16_to_24(msg.data, upsample_state)
                                 if pcm24k:
                                     await aai_ws.send_json({
                                         "type": "input.audio",
@@ -262,6 +264,7 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
                 async def aai_to_bluejay():
                     """Pump from AAI (JSON events) to Bluejay (binary + CHIRP text)."""
                     nonlocal session_id, current_utterance_id
+                    downsample_state = None  # carried across audioop.ratecv calls
                     try:
                         async for msg in aai_ws:
                             if msg.type != WSMsgType.TEXT:
@@ -316,7 +319,8 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
                                 audio_b64 = event.get("data", "")
                                 if audio_b64:
                                     pcm24k = base64.b64decode(audio_b64)
-                                    await safe_send_bytes(downsample_24_to_16(pcm24k))
+                                    pcm16k, downsample_state = downsample_24_to_16(pcm24k, downsample_state)
+                                    await safe_send_bytes(pcm16k)
 
                             elif t == "tool.call":
                                 # Spawn the MCP call in the background so the
