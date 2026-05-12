@@ -198,22 +198,43 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
                     binary_count = 0
                     binary_bytes = 0
                     last_logged_at = 0
+                    window_peak = 0  # max absolute sample value since last log
+                    window_sum_sq = 0.0  # for RMS
+                    window_sample_count = 0
                     other_types: dict = {}
                     try:
                         async for msg in bluejay_ws:
                             if msg.type == WSMsgType.BINARY:
                                 binary_count += 1
                                 binary_bytes += len(msg.data)
+                                # Inspect amplitude of the raw 16k frame so
+                                # we can tell silence from speech.
+                                in_samples = np.frombuffer(msg.data, dtype=np.int16)
+                                if in_samples.size:
+                                    peak = int(np.abs(in_samples).max())
+                                    if peak > window_peak:
+                                        window_peak = peak
+                                    window_sum_sq += float((in_samples.astype(np.float32) ** 2).sum())
+                                    window_sample_count += in_samples.size
                                 pcm24k = upsample_16_to_24(msg.data)
                                 if pcm24k:
                                     await aai_ws.send_json({
                                         "type": "input.audio",
                                         "audio": base64.b64encode(pcm24k).decode(),
                                     })
-                                # Log every ~1s of audio (assuming 20ms frames).
+                                # Log every ~1s of audio with peak/RMS so we
+                                # can tell silence from speech at a glance.
                                 if binary_count - last_logged_at >= 50:
-                                    print(f"  Bluejay audio: {binary_count} frames, {binary_bytes} bytes total")
+                                    rms = (window_sum_sq / window_sample_count) ** 0.5 if window_sample_count else 0.0
+                                    print(
+                                        f"  Bluejay audio: {binary_count} frames, "
+                                        f"{binary_bytes} bytes total, "
+                                        f"window peak={window_peak}, rms={rms:.1f}"
+                                    )
                                     last_logged_at = binary_count
+                                    window_peak = 0
+                                    window_sum_sq = 0.0
+                                    window_sample_count = 0
                             elif msg.type == WSMsgType.TEXT:
                                 # Optional CHIRP control events from Bluejay.
                                 # We trust AAI's audio-driven VAD for barge-in,
