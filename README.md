@@ -27,7 +27,6 @@ simulations exercise the real conversational surface.
 | `CHIRP_PASS` | yes (prod) | Basic-auth password Bluejay sends. Skip for dev. |
 | `PORT` | auto | Railway injects. Defaults to 8767 locally. |
 | `AAI_WS_URL` | no | Override upstream (e.g. EU endpoint). |
-| `SLACK_WEBHOOK_URL` | no | Optional — posts each transcript with `[Bluejay sim]` tag. |
 
 ## Run locally
 

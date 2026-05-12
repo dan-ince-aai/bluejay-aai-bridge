@@ -54,10 +54,6 @@ PORT = int(os.getenv("PORT", 8767))
 CHIRP_USER = os.getenv("CHIRP_USER", "")
 CHIRP_PASS = os.getenv("CHIRP_PASS", "")
 
-# Optional Slack webhook for transcripts. Tagged [Bluejay sim] so simulator
-# runs don't get mixed in with real traffic.
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-
 # Audio constants — Bluejay 16k mono pcm_s16le, AAI 24k mono pcm_s16le.
 BLUEJAY_RATE = 16_000
 AAI_RATE = 24_000
@@ -111,26 +107,6 @@ def expected_basic_auth() -> Optional[str]:
         return None
     creds = f"{CHIRP_USER}:{CHIRP_PASS}".encode()
     return "Basic " + base64.b64encode(creds).decode()
-
-
-# ---------------------------------------------------------------------------
-# Slack — optional, fire-and-forget transcript posting
-# ---------------------------------------------------------------------------
-
-
-async def post_transcript_to_slack(text: str) -> None:
-    if not SLACK_WEBHOOK_URL:
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(
-                SLACK_WEBHOOK_URL,
-                json={"text": text},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=5),
-            )
-    except Exception as e:
-        print(f"Slack post failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -370,19 +346,6 @@ async def bluejay_handler(request: web.Request) -> web.WebSocketResponse:
     duration = (datetime.now(timezone.utc) - session_start).total_seconds()
     print(f"Bluejay disconnected (session: {duration:.0f}s, {len(transcript)} turns)")
 
-    if transcript and SLACK_WEBHOOK_URL:
-        sid = session_id or "unknown"
-        slack_text = f"*[Bluejay sim] Voice Agent Session* (`{sid}`, {duration:.0f}s)\n\n"
-        for m in transcript:
-            role = m["role"]
-            text = m["text"]
-            if role == "user":
-                slack_text += f"👤 User: {text}\n"
-            elif role == "agent":
-                tag = " _(interrupted)_" if m.get("interrupted") else ""
-                slack_text += f"🤖 Agent: {text}{tag}\n"
-        await post_transcript_to_slack(slack_text)
-
     return bluejay_ws
 
 
@@ -426,7 +389,6 @@ async def main():
     print(f"Bluejay <-> AAI bridge — port {PORT}")
     print(f"Upstream: {AAI_WS_URL}")
     print(f"CHIRP auth required: {bool(CHIRP_USER and CHIRP_PASS)}")
-    print(f"Slack transcripts: {bool(SLACK_WEBHOOK_URL)}")
 
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/", root_handler)
