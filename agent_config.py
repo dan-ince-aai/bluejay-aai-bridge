@@ -503,10 +503,6 @@ def session_config(voice: str) -> dict:
             "tools": TOOLS,
             "input": {
                 "type": "audio",
-                "turn_detection": {
-                    "min_silence": 1000,
-                    "max_silence": 3000,
-                },
                 "keyterms": ["Retell", "Vapi"],
             },
             "output": {
